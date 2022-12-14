@@ -3,27 +3,50 @@
 # Description: A Python wrapper for OpenAI's chatbot API
 import json
 import uuid
+import asyncio
 
-import requests
+import httpx
 
-from OpenAIAuth.OpenAIAuth import OpenAIAuth, Debugger
+import nest_asyncio
 
-BASE_URL = "https://chat.openai.com/"
+from typing import List
+
+from playwright.async_api import async_playwright
+from cf_clearance2 import async_cf_retry, async_stealth
 
 
 def generate_uuid() -> str:
     """
-    Generates a UUID for the session -- Internal use only
+    Generate a UUID for the session -- Internal use only
 
-    :return: str
+    :return: a random UUID
+    :rtype: :obj:`str`
     """
     uid = str(uuid.uuid4())
     return uid
 
 
-class Chatbot:
+async def __async_func_for_check():
+    pass
+
+
+class Debugger:
+    def __init__(self, debug: bool = False):
+        if debug:
+            print("Debugger enabled on OpenAIAuth")
+        self.debug = debug
+
+    def set_debug(self, debug: bool):
+        self.debug = debug
+
+    def log(self, message: str, end: str = "\n"):
+        if self.debug:
+            print(message, end=end)
+
+
+class AsyncChatbot:
     """
-    Initializes the chatbot
+    Initialize the AsyncChatbot.
 
     See wiki for the configuration json:
     https://github.com/acheong08/ChatGPT/wiki/Setup
@@ -34,171 +57,194 @@ class Chatbot:
     :param conversation_id: The conversation ID
     :type conversation_id: :obj:`str`, optional
 
+    :param parent_id: The parent ID
+    :type parent_id: :obj:`str`, optional
+
     :param debug: Whether to enable debug mode
     :type debug: :obj:`bool`, optional
 
-    :param refresh: Whether to refresh the session or Exception
+    :param refresh: Whether to refresh the session
+    :type refresh: :obj:`bool`, optional
+
+    :param request_timeout: The network request timeout seconds
+    :type request_timeout: :obj:`int`, optional
+
+    :param base_url: The base url to chat.openai.com backend server,
+        useful when set up a reverse proxy to avoid network issue.
+    :type base_url: :obj:`str`, optional
+
+    :return: The Chatbot object
+    :rtype: :obj:`Chatbot`
     """
     config: json
     conversation_id: str
     parent_id: str
+    base_url: str
     headers: dict
-    conversation_id_prev: str
-    parent_id_prev: str
+    conversation_id_prev_queue: List
+    parent_id_prev_queue: List
+    request_timeout: int
+    captcha_solver: any
 
-    def __init__(self, config, conversation_id=None, debug=False, refresh=True) -> Exception:
+    def __init__(self, config, conversation_id=None, parent_id=None, debug=False, request_timeout=100,
+                 captcha_solver=None, base_url="https://chat.openai.com/", max_rollbacks=20):
         self.debugger = Debugger(debug)
         self.debug = debug
         self.config = config
         self.conversation_id = conversation_id
-        self.parent_id = generate_uuid()
-        if "session_token" in config or ("email" in config and "password" in config) and refresh:
-            self.refresh_session()
-        if "Authorization" in config:
-            self.refresh_headers()
+        self.parent_id = parent_id if parent_id else generate_uuid()
+        self.base_url = base_url
+        self.request_timeout = request_timeout
+        self.captcha_solver = captcha_solver
+        self.max_rollbacks = max_rollbacks
+        self.conversation_id_prev_queue = []
+        self.parent_id_prev_queue = []
+        self.config["accept_language"] = 'en-US,en' if "accept_language" not in self.config.keys(
+        ) else self.config["accept_language"]
+        self.config["user_agent"] = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.36" if "user_agent" not in self.config.keys(
+        ) else self.config["user_agent"]
+        self.headers = {
+            "Accept": "text/event-stream",
+            "Authorization": "Bearer ",
+            "Content-Type": "application/json",
+            "User-Agent": self.config["user_agent"],
+            "X-Openai-Assistant-App-Id": "",
+            "Connection": "close",
+            "Accept-Language": self.config["accept_language"]+";q=0.9",
+            "Referer": "https://chat.openai.com/chat",
+        }
+        self.refresh_session()
 
     def reset_chat(self) -> None:
         """
-        Resets the conversation ID and parent ID
+        Reset the conversation ID and parent ID.
 
         :return: None
         """
         self.conversation_id = None
         self.parent_id = generate_uuid()
 
-    def refresh_headers(self) -> None:
+    def __refresh_headers(self) -> None:
         """
-        Refreshes the headers -- Internal use only
+        Refresh the headers -- Internal use only
 
         :return: None
         """
-        if "Authorization" not in self.config:
+        if not self.config.get("Authorization"):
             self.config["Authorization"] = ""
-        elif self.config["Authorization"] is None:
-            self.config["Authorization"] = ""
-        self.headers = {
-            "Host": "chat.openai.com",
-            "Accept": "text/event-stream",
-            "Authorization": "Bearer " + self.config["Authorization"],
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) "
-            "Version/16.1 Safari/605.1.15",
-            "X-Openai-Assistant-App-Id": "",
-            "Connection": "close",
-            "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://chat.openai.com/chat",
-        }
+        self.headers["Authorization"] = "Bearer " + \
+            self.config["Authorization"]
+        self.headers["User-Agent"] = self.config["user_agent"]
 
-    def get_chat_stream(self, data) -> None:
+    async def __get_chat_stream(self, data) -> None:
         """
-        Generator for chat stream -- Internal use only
+        Generator for the chat stream -- Internal use only
 
         :param data: The data to send
+        :type data: :obj:`dict`
 
         :return: None
         """
-        response = requests.post(
-            BASE_URL+"backend-api/conversation",
+        s = httpx.AsyncClient()
+        # Set cloudflare cookies
+        if "cf_clearance" in self.config:
+            s.cookies.set(
+                "cf_clearance",
+                self.config["cf_clearance"],
+            )
+        async with s.stream(
+            'POST',
+            self.base_url + "backend-api/conversation",
             headers=self.headers,
             data=json.dumps(data),
-            stream=True,
-            timeout=100,
-        )
-        for line in response.iter_lines():
-            try:
-                line = line.decode("utf-8")
-                if line == "":
-                    continue
-                line = line[6:]
-                line = json.loads(line)
+            timeout=self.request_timeout,
+        ) as response:
+            async for line in response.aiter_lines():
                 try:
+                    line = line[:-1]
+                    if line == "" or line == "data: [DONE]":
+                        continue
+                    line = line[6:]
+                    line = json.loads(line)
+                    if len(line["message"]["content"]["parts"]) == 0:
+                        continue
                     message = line["message"]["content"]["parts"][0]
                     self.conversation_id = line["conversation_id"]
                     self.parent_id = line["message"]["id"]
-                except:  # This needs fixing. Automatic detect blank lines and done lines
-                    continue
-                yield {
+                    yield {
+                        "message": message,
+                        "conversation_id": self.conversation_id,
+                        "parent_id": self.parent_id,
+                    }
+                except Exception as exc:
+                    self.debugger.log(
+                        f"Error when handling response, got values{line}")
+                    raise Exception(
+                        f"Error when handling response, got values{line}") from exc
+
+    async def __get_chat_text(self, data) -> dict:
+        """
+        Get the chat response as text -- Internal use only
+        :param data: The data to send
+        :type data: :obj:`dict`
+        :return: The chat response
+        :rtype: :obj:`dict`
+        """
+        # Create request session
+        async with httpx.AsyncClient() as s:
+            # set headers
+            s.headers = self.headers
+            # Set cloudflare cookies
+            if "cf_clearance" in self.config:
+                s.cookies.set(
+                    "cf_clearance",
+                    self.config["cf_clearance"],
+                )
+            # Set proxies
+            if self.config.get("proxy", "") != "":
+                s.proxies = {
+                    "http": self.config["proxy"],
+                    "https": self.config["proxy"],
+                }
+            response = await s.post(
+                self.base_url + "backend-api/conversation",
+                data=json.dumps(data),
+                timeout=self.request_timeout,
+            )
+            try:
+                response = response.text.splitlines()[-4]
+                response = response[6:]
+            except Exception as exc:
+                self.debugger.log("Incorrect response from OpenAI API")
+                raise Exception("Incorrect response from OpenAI API") from exc
+            # Check if it is JSON
+            if response.startswith("{"):
+                response = json.loads(response)
+                self.parent_id = response["message"]["id"]
+                self.conversation_id = response["conversation_id"]
+                message = response["message"]["content"]["parts"][0]
+                return {
                     "message": message,
                     "conversation_id": self.conversation_id,
                     "parent_id": self.parent_id,
                 }
-            except:  # Not sure what error occurs here. Needs looking into
-                continue
+            else:
+                return None
 
-    def get_chat_text(self, data) -> dict:
+    async def get_chat_response(self, prompt: str, output="text", conversation_id=None, parent_id=None) -> dict or None:
         """
-        Gets the chat response as text -- Internal use only
+        Get the chat response.
 
-        :param data: The data to send
-
-        :return: The chat response
-        """
-        # Create request session
-        s = requests.Session()
-        # set headers
-        s.headers = self.headers
-        # Set multiple cookies
-        if "session_token" in self.config:
-            s.cookies.set(
-                "__Secure-next-auth.session-token",
-                self.config["session_token"],
-            )
-        s.cookies.set(
-            "__Secure-next-auth.callback-url",
-            "https://chat.openai.com/",
-        )
-        # Set proxies
-        if self.config.get("proxy", "") != "":
-            s.proxies = {
-                "http": self.config["proxy"],
-                "https": self.config["proxy"],
-            }
-        response = s.post(
-            BASE_URL+"backend-api/conversation",
-            data=json.dumps(data),
-        )
-        try:
-            response = response.text.splitlines()[-4]
-            response = response[6:]
-        except Exception as exc:
-            self.debugger.log("Incorrect response from OpenAI API")
-            try:
-                resp = response.json()
-                self.debugger.log(resp)
-                if resp['detail']['code'] == "invalid_api_key" or resp['detail']['code'] == "token_expired":
-                    if "email" in self.config and "password" in self.config:
-                        self.refresh_session()
-                        return self.get_chat_text(data)
-                    else:
-                        self.debugger.log("Missing necessary credentials")
-                        raise Exception(
-                            "Missing necessary credentials") from exc
-            except Exception as exc2:
-                raise Exception("Not a JSON response") from exc2
-            raise Exception("Incorrect response from OpenAI API") from exc
-        response = json.loads(response)
-        self.parent_id = response["message"]["id"]
-        self.conversation_id = response["conversation_id"]
-        message = response["message"]["content"]["parts"][0]
-        return {
-            "message": message,
-            "conversation_id": self.conversation_id,
-            "parent_id": self.parent_id,
-        }
-
-    def get_chat_response(self, prompt: str, output="text") -> dict or None:
-        """
-        Gets the chat response
-
-        :param prompt: The message sent
+        :param prompt: The message sent to the chatbot
         :type prompt: :obj:`str`
 
-        :param output: The output type (`text` or `stream`)
+        :param output: The output type `text` or `stream`
         :type output: :obj:`str`, optional
 
-        :return: The chat response
-            `{"message": "Returned messages", "conversation_id": "conversation ID", "parent_id": "parent ID"}` or None or Exception
+        :return: The chat response `{"message": "Returned messages", "conversation_id": "conversation ID", "parent_id": "parent ID"}` or None
+        :rtype: :obj:`dict` or :obj:`None`
         """
+        self.refresh_session(running_in_async=True)
         data = {
             "action": "next",
             "messages": [
@@ -208,50 +254,48 @@ class Chatbot:
                     "content": {"content_type": "text", "parts": [prompt]},
                 },
             ],
-            "conversation_id": self.conversation_id,
-            "parent_message_id": self.parent_id,
+            "conversation_id": conversation_id or self.conversation_id,
+            "parent_message_id": parent_id or self.parent_id,
             "model": "text-davinci-002-render",
         }
-        self.conversation_id_prev = self.conversation_id
-        self.parent_id_prev = self.parent_id
+        self.conversation_id_prev_queue.append(
+            data["conversation_id"])  # for rollback
+        self.parent_id_prev_queue.append(data["parent_message_id"])
+        while len(self.conversation_id_prev_queue) > self.max_rollbacks:  # LRU, remove oldest
+            self.conversation_id_prev_queue.pop(0)
+        while len(self.parent_id_prev_queue) > self.max_rollbacks:
+            self.parent_id_prev_queue.pop(0)
         if output == "text":
-            return self.get_chat_text(data)
+            return await self.__get_chat_text(data)
         elif output == "stream":
-            return self.get_chat_stream(data)
+            return self.__get_chat_stream(data)
         else:
             raise ValueError("Output must be either 'text' or 'stream'")
 
-    def rollback_conversation(self) -> None:
+    def rollback_conversation(self, num=1) -> None:
         """
-        Rollbacks the conversation
+        Rollback the conversation.
+        :param num: The number of messages to rollback
+        :return: None
+        """
+        for i in range(num):
+            self.conversation_id = self.conversation_id_prev_queue.pop()
+            self.parent_id = self.parent_id_prev_queue.pop()
+
+    def refresh_session(self, running_in_async=False) -> None:
+        """
+        Refresh the session.
 
         :return: None
         """
-        self.conversation_id = self.conversation_id_prev
-        self.parent_id = self.parent_id_prev
-
-    def refresh_session(self) -> Exception:
-        """
-        Refreshes the session
-
-        :return: None or Exception
-        """
-        if (
-            "session_token" not in self.config
-            and ("email" not in self.config or "password" not in self.config)
-            and "Authorization" not in self.config
-        ):
-            error = ValueError("No tokens provided")
-            self.debugger.log(error)
-            raise error
-        elif "session_token" in self.config:
-            if (
-                self.config["session_token"] is None
-                or self.config["session_token"] == ""
-            ):
-                raise ValueError("No tokens provided")
-            s = requests.Session()
-            if self.config.get("proxy", "") != "":
+        if running_in_async:
+            nest_asyncio.apply()
+        # Either session_token, email and password or Authorization is required
+        if not self.config.get("cf_clearance") or not self.config.get("session_token"):
+            asyncio.run(self.get_cf_cookies())
+        if self.config.get("session_token") and self.config.get("cf_clearance"):
+            s = httpx.Client()
+            if self.config.get("proxy"):
                 s.proxies = {
                     "http": self.config["proxy"],
                     "https": self.config["proxy"],
@@ -261,98 +305,263 @@ class Chatbot:
                 "__Secure-next-auth.session-token",
                 self.config["session_token"],
             )
+
+            s.cookies.set(
+                "cf_clearance",
+                self.config["cf_clearance"],
+            )
             # s.cookies.set("__Secure-next-auth.csrf-token", self.config['csrf_token'])
             response = s.get(
-                BASE_URL+"api/auth/session",
+                self.base_url + "api/auth/session",
                 headers={
-                    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, "
-                    "like Gecko) Version/16.1 Safari/605.1.15 ",
+                    "User-Agent": self.config["user_agent"],
                 },
             )
+            # Check the response code
             if response.status_code != 200:
-                self.debugger.log("Invalid status code")
-                self.debugger.log(response.status_code)
-                raise Exception("Wrong response code")
+                if response.status_code == 403:
+                    asyncio.run(self.get_cf_cookies())
+                    self.refresh_session(running_in_async=running_in_async)
+                    return
+                else:
+                    self.debugger.log(
+                        f"Invalid status code: {response.status_code}")
+                    raise Exception("Wrong response code")
+            # Try to get new session token and Authorization
             try:
+                if 'error' in response.json():
+                    self.debugger.log("Error in response JSON")
+                    self.debugger.log(response.json()['error'])
+                    raise Exception
                 self.config["session_token"] = response.cookies.get(
                     "__Secure-next-auth.session-token",
                 )
                 self.config["Authorization"] = response.json()["accessToken"]
-                self.refresh_headers()
+                self.__refresh_headers()
+            # If it fails, try to login with email and password to get tokens
             except Exception as exc:
-                print("Error refreshing session")
-                self.debugger.log("Response: '" + str(response.text) + "'")
-                self.debugger.log(response.status_code)
                 # Check if response JSON is empty
                 if response.json() == {}:
                     self.debugger.log("Empty response")
                     self.debugger.log("Probably invalid session token")
-                    if 'email' in self.config and 'password' in self.config:
-                        del self.config['session_token']
-                        self.login(self.config['email'],
-                                   self.config['password'])
-                        return
-                    else:
-                        raise ValueError(
-                            "No email and password provided") from exc
-                raise Exception("Error refreshing session") from exc
-        elif "email" in self.config and "password" in self.config:
-            try:
-                self.login(self.config["email"], self.config["password"])
-            except Exception as exc:
-                self.debugger.log("Login failed")
-                raise exc
-        elif "Authorization" in self.config:
-            self.refresh_headers()
+                # Check if ['detail']['code'] == 'token_expired' in response JSON
+                # First check if detail is in response JSON
+                elif 'detail' in response.json():
+                    # Check if code is in response JSON
+                    if 'code' in response.json()['detail']:
+                        # Check if code is token_expired
+                        if response.json()['detail']['code'] == 'token_expired':
+                            self.debugger.log("Token expired")
+                raise Exception("Failed to refresh session") from exc
             return
         else:
-            raise ValueError("No tokens provided")
+            self.debugger.log(
+                "No session_token, email and password or Authorization provided")
+            raise ValueError(
+                "No session_token, email and password or Authorization provided")
 
-    def login(self, email: str, password: str) -> None:
+    async def get_cf_cookies(self) -> None:
         """
-        Logs in to OpenAI
-
-        :param email: The email
-        :type email: :obj:`str`
-
-        :param password: The password
-        :type password: :obj:`str`
+        Get cloudflare cookies.
 
         :return: None
         """
-        self.debugger.log("Logging in...")
-        use_proxy = False
-        proxy = None
-        if "proxy" in self.config:
-            if self.config["proxy"] != "":
-                use_proxy = True
-                proxy = self.config["proxy"]
-        auth = OpenAIAuth(email, password, use_proxy, proxy, debug=self.debug)
-        try:
-            auth.begin()
-        except Exception as exc:
-            # if ValueError with e as "Captcha detected" fail
-            if exc == "Captcha detected":
-                self.debugger.log(
-                    "Captcha not supported. Use session tokens instead.")
-                raise ValueError("Captcha detected") from exc
-            raise exc
-        if auth.access_token is not None:
-            self.config["Authorization"] = auth.access_token
-            if auth.session_token is not None:
-                self.config["session_token"] = auth.session_token
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=False)
+            page = await browser.new_page()
+            await async_stealth(page, pure=False)
+            await page.goto('https://chat.openai.com/')
+            page_wait_for_url = 'https://chat.openai.com/chat' if not self.config.get(
+                'session_token') else None
+            res = await async_cf_retry(
+                page, wait_for_url=page_wait_for_url)
+            if res:
+                cookies = await page.context.cookies()
+                for cookie in cookies:
+                    if cookie.get('name') == 'cf_clearance':
+                        cf_clearance_value = cookie.get('value')
+                        self.debugger.log(cf_clearance_value)
+                    elif cookie.get('name') == '__Secure-next-auth.session-token':
+                        self.config['session_token'] = cookie.get('value')
+                ua = await page.evaluate('() => {return navigator.userAgent}')
+                self.debugger.log(ua)
             else:
-                possible_tokens = auth.session.cookies.get(
-                    "__Secure-next-auth.session-token",
-                )
-                if possible_tokens is not None:
-                    if len(possible_tokens) > 1:
-                        self.config["session_token"] = possible_tokens[0]
-                    else:
-                        try:
-                            self.config["session_token"] = possible_tokens
-                        except Exception as exc:
-                            raise Exception("Error logging in") from exc
-            self.refresh_headers()
-        else:
-            raise Exception("Error logging in")
+                self.debugger.log("cf challenge fail")
+                raise Exception("cf challenge fail")
+            await browser.close()
+            del browser
+            self.config['cf_clearance'] = cf_clearance_value
+            self.config['user_agent'] = ua
+
+    def send_feedback(
+        self,
+        is_good: bool,
+        is_harmful=False,
+        is_not_true=False,
+        is_not_helpful=False,
+        description=None,
+    ):
+        from dataclasses import dataclass
+
+        @ dataclass
+        class ChatGPTTags:
+            Harmful = "harmful"
+            NotTrue = "false"
+            NotHelpful = "not-helpful"
+
+        url = self.base_url + "backend-api/conversation/message_feedback"
+
+        data = {
+            "conversation_id": self.conversation_id,
+            "message_id": self.parent_id,
+            "rating": "thumbsUp" if is_good else "thumbsDown",
+        }
+
+        if not is_good:
+            tags = list()
+            if is_harmful:
+                tags.append(ChatGPTTags.Harmful)
+            if is_not_true:
+                tags.append(ChatGPTTags.NotTrue)
+            if is_not_helpful:
+                tags.append(ChatGPTTags.NotHelpful)
+            data["tags"] = tags
+
+        if description is not None:
+            data["text"] = description
+
+        response = httpx.post(
+            url,
+            headers=self.headers,
+            data=json.dumps(data),
+            timeout=self.request_timeout,
+        )
+
+        return response
+
+
+class Chatbot(AsyncChatbot):
+    """
+    Initialize the Chatbot.
+
+    See wiki for the configuration json:
+    https://github.com/acheong08/ChatGPT/wiki/Setup
+
+    :param config: The configuration json
+    :type config: :obj:`json`
+
+    :param conversation_id: The conversation ID
+    :type conversation_id: :obj:`str`, optional
+
+    :param parent_id: The parent ID
+    :type parent_id: :obj:`str`, optional
+
+    :param debug: Whether to enable debug mode
+    :type debug: :obj:`bool`, optional
+
+    :param refresh: Whether to refresh the session
+    :type refresh: :obj:`bool`, optional
+
+    :param request_timeout: The network request timeout seconds
+    :type request_timeout: :obj:`int`, optional
+
+    :param base_url: The base url to chat.openai.com backend server,
+        useful when set up a reverse proxy to avoid network issue.
+    :type base_url: :obj:`str`, optional
+
+    :return: The Chatbot object
+    :rtype: :obj:`Chatbot`
+    """
+
+    def __get_chat_stream(self, data) -> None:
+        """
+        Generator for the chat stream -- Internal use only
+
+        :param data: The data to send
+        :type data: :obj:`dict`
+
+        :return: None
+        """
+        s = httpx.Client()
+        # Set cloudflare cookies
+        if "cf_clearance" in self.config:
+            s.cookies.set(
+                "cf_clearance",
+                self.config["cf_clearance"],
+            )
+        with s.stream(
+            'POST',
+            self.base_url + "backend-api/conversation",
+            headers=self.headers,
+            data=json.dumps(data),
+            timeout=self.request_timeout,
+        ) as response:
+            for line in response.iter_lines():
+                try:
+                    line = line[:-1]
+                    if line == "" or line == "data: [DONE]":
+                        continue
+                    line = line[6:]
+                    line = json.loads(line)
+                    if len(line["message"]["content"]["parts"]) == 0:
+                        continue
+                    message = line["message"]["content"]["parts"][0]
+                    self.conversation_id = line["conversation_id"]
+                    self.parent_id = line["message"]["id"]
+                    yield {
+                        "message": message,
+                        "conversation_id": self.conversation_id,
+                        "parent_id": self.parent_id,
+                    }
+                except Exception as exc:
+                    self.debugger.log(
+                        f"Error when handling response, got values{line}")
+                    raise Exception(
+                        f"Error when handling response, got values{line}") from exc
+
+    def get_chat_response(self, prompt: str, output="text", conversation_id=None, parent_id=None) -> dict or None:
+        """
+        Get the chat response.
+
+        :param prompt: The message sent to the chatbot
+        :type prompt: :obj:`str`
+
+        :param output: The output type `text` or `stream`
+        :type output: :obj:`str`, optional
+
+        :return: The chat response `{"message": "Returned messages", "conversation_id": "conversation ID", "parent_id": "parent ID"}` or None
+        :rtype: :obj:`dict` or :obj:`None`
+        """
+        try:
+            # Check if running in nest use of asyncio.run()
+            asyncio.run(self.__async_func_for_check())
+        except RuntimeError:
+            self.debugger.log("detect nest use of asyncio")
+            nest_asyncio.apply()
+        self.refresh_session()
+        if output == "text":
+            coroutine_object = super().get_chat_response(
+                prompt, output, conversation_id, parent_id)
+            return asyncio.run(coroutine_object)
+
+        if output == "stream":
+            data = {
+                "action": "next",
+                "messages": [
+                    {
+                        "id": str(generate_uuid()),
+                        "role": "user",
+                        "content": {"content_type": "text", "parts": [prompt]},
+                    },
+                ],
+                "conversation_id": conversation_id or self.conversation_id,
+                "parent_message_id": parent_id or self.parent_id,
+                "model": "text-davinci-002-render",
+            }
+            self.conversation_id_prev_queue.append(
+                data["conversation_id"])  # for rollback
+            self.parent_id_prev_queue.append(data["parent_message_id"])
+            return self.__get_chat_stream(data)
+
+    async def __async_func_for_check(self):
+        pass

@@ -21,5 +21,3 @@ You:
                 !config - Show the current configuration
                 !exit - Exit the program
 ```
-
-Refresh every so often in case the token expires.
