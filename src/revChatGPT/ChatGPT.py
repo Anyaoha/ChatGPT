@@ -1,7 +1,7 @@
 import uuid
 import re
 import json
-import tls_client_for_chatGPT as tls_client
+import tls_client
 import undetected_chromedriver as uc
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -22,10 +22,10 @@ class Chrome(uc.Chrome):
 
 
 class Chatbot:
-    def __init__(self, config, conversation_id=None, parent_id=None) -> None:
+    def __init__(self, config, conversation_id=None, parent_id=None, no_refresh=False) -> None:
         self.config = config
         self.session = tls_client.Session(
-            client_identifier="chrome_105"
+            client_identifier="chrome_108"
         )
         if "proxy" in config:
             if type(config["proxy"]) != str:
@@ -43,6 +43,7 @@ class Chatbot:
             self.verbose = False
         self.conversation_id = conversation_id
         self.parent_id = parent_id
+        self.conversation_mapping = {}
         self.conversation_id_prev_queue = []
         self.parent_id_prev_queue = []
         self.isMicrosoftLogin = False
@@ -69,6 +70,9 @@ class Chatbot:
             else:
                 raise Exception("Invalid config!")
         elif "session_token" in config:
+            if no_refresh:
+                self.get_cf_cookies()
+                return
             if type(config["session_token"]) != str:
                 raise Exception("Session token must be a string!")
             self.session_token = config["session_token"]
@@ -77,22 +81,33 @@ class Chatbot:
             self.get_cf_cookies()
         else:
             raise Exception("Invalid config!")
-        refresh = True
-        while refresh:
-            try:
-                self.refresh_session()
-                refresh = False
-            except Exception:
-                pass
+        self.retry_refresh()
 
-    def ask(self, prompt, conversation_id=None, parent_id=None):
+    def retry_refresh(self):
+        retries = 5
         refresh = True
         while refresh:
             try:
                 self.refresh_session()
                 refresh = False
             except Exception:
-                pass
+                if retries == 0:
+                    raise Exception("Failed to refresh session!")
+                retries -= 1
+
+    def ask(self, prompt, conversation_id=None, parent_id=None, gen_title=False, session_token=None):
+        if session_token:
+            self.session.cookies.set(
+                "__Secure-next-auth.session-token", session_token)
+            self.session_token = session_token
+            self.config["session_token"] = session_token
+        self.retry_refresh()
+        self.map_conversations()
+        if conversation_id == None:
+            conversation_id = self.conversation_id
+        if parent_id == None:
+            parent_id = self.parent_id if conversation_id == self.conversation_id else self.conversation_mapping[
+                conversation_id]
         data = {
             "action": "next",
             "messages": [
@@ -102,16 +117,18 @@ class Chatbot:
                     "content": {"content_type": "text", "parts": [prompt]},
                 },
             ],
-            "conversation_id": conversation_id or self.conversation_id,
-            "parent_message_id": parent_id or self.parent_id or str(uuid.uuid4()),
+            "conversation_id": conversation_id,
+            "parent_message_id": parent_id or str(uuid.uuid4()),
             "model": "text-davinci-002-render",
         }
+        new_conv = data["conversation_id"] is None
         self.conversation_id_prev_queue.append(
             data["conversation_id"])  # for rollback
         self.parent_id_prev_queue.append(data["parent_message_id"])
         response = self.session.post(
             url=BASE_URL + "backend-api/conversation",
-            data=json.dumps(data)
+            data=json.dumps(data),
+            timeout_seconds=180
         )
         if response.status_code != 200:
             print(response.text)
@@ -130,17 +147,76 @@ class Chatbot:
                 self.parent_id = response["message"]["id"]
                 self.conversation_id = response["conversation_id"]
                 message = response["message"]["content"]["parts"][0]
-                return {
+                res = {
                     "message": message,
                     "conversation_id": self.conversation_id,
                     "parent_id": self.parent_id,
                 }
+                if gen_title and new_conv:
+                    try:
+                        title = self.gen_title(
+                            self.conversation_id, self.parent_id)["title"]
+                    except Exception as exc:
+                        split = prompt.split(" ")
+                        title = " ".join(split[:3]) + \
+                            ("..." if len(split) > 3 else "")
+                    res["title"] = title
+                return res
             else:
                 return None
 
-    def refresh_session(self):
-        url = BASE_URL + "api/auth/session"
+    def check_response(self, response):
+        if response.status_code != 200:
+            print(response.text)
+            raise Exception("Response code error: ", response.status_code)
+
+    def get_conversations(self, offset=0, limit=20):
+        url = BASE_URL + \
+            f"backend-api/conversations?offset={offset}&limit={limit}"
         response = self.session.get(url)
+        self.check_response(response)
+        data = json.loads(response.text)
+        return data["items"]
+
+    def get_msg_history(self, id):
+        url = BASE_URL + f"backend-api/conversation/{id}"
+        response = self.session.get(url)
+        self.check_response(response)
+        data = json.loads(response.text)
+        return data
+
+    def gen_title(self, id, message_id):
+        url = BASE_URL + f"backend-api/conversation/gen_title/{id}"
+        response = self.session.post(url, data=json.dumps(
+            {"message_id": message_id, "model": "text-davinci-002-render"}))
+        self.check_response(response)
+        data = json.loads(response.text)
+        return data
+
+    def change_title(self, id, title):
+        url = BASE_URL + f"backend-api/conversation/{id}"
+        response = self.session.patch(url, data=f'{{"title": {title}}}')
+        self.check_response(response)
+
+    def delete_conversation(self, id):
+        url = BASE_URL + f"backend-api/conversation/{id}"
+        response = self.session.patch(url, data='{"is_visible": false}')
+        self.check_response(response)
+
+    def map_conversations(self):
+        conversations = self.get_conversations()
+        histories = [self.get_msg_history(x["id"]) for x in conversations]
+        for x, y in zip(conversations, histories):
+            self.conversation_mapping[x["id"]] = y["current_node"]
+
+    def refresh_session(self, session_token=None):
+        if session_token:
+            self.session.cookies.set(
+                "__Secure-next-auth.session-token", session_token)
+            self.session_token = session_token
+            self.config["session_token"] = session_token
+        url = BASE_URL + "api/auth/session"
+        response = self.session.get(url, timeout_seconds=180)
         if response.status_code == 403:
             self.get_cf_cookies()
             raise Exception("Clearance refreshing...")
@@ -154,6 +230,8 @@ class Chatbot:
                 self.session.headers.update({
                     "Authorization": "Bearer " + response.json()["accessToken"]
                 })
+            self.session_token = self.session.cookies._find(
+                "__Secure-next-auth.session-token", )
         except Exception as exc:
             print("Failed to refresh session!")
             if self.isMicrosoftLogin:

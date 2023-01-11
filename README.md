@@ -3,16 +3,17 @@
 [![PyPi](https://img.shields.io/pypi/v/revChatGPT.svg)](https://pypi.python.org/pypi/revChatGPT)
 [![PyPi](https://img.shields.io/pypi/dm/revChatGPT.svg)](https://pypi.python.org/pypi/revChatGPT)
 
-Reverse Engineered ChatGPT by OpenAI. Extensible for chatbots etc.
+Reverse Engineered ChatGPT API by OpenAI. Extensible for chatbots etc.
 
-Connect with me on [Linkedin](https://www.linkedin.com/in/acheong08/) to support this project. I'm graduating high school soon and knowing some people might help my chances at finding employment. 
+Connect with me on [Linkedin](https://www.linkedin.com/in/acheong08/) to support this project. I'm graduating high school soon and knowing some people might help my chances at finding employment (in the far future). 
 <br><br>
 You can also follow me on [Twitter](https://twitter.com/GodlyIgnorance) to stay up to date.
 
 ### Related works
-This is the library implementation. For an API that scales, check out https://github.com/ChatGPT-Hackers/ChatGPT-API-server (By me as well)
+- API that scales: https://github.com/ChatGPT-Hackers/ChatGPT-API-server (By me as well)
+- Lightweight version: https://github.com/acheong08/ChatGPT-lite (In collaboration with [Pawan](https://github.com/PawanOsman/))
 
-The API is a separate project and not part of this library.
+*These are separate works and not part of this library*
 
 # Usage
 
@@ -57,6 +58,7 @@ This is not an official OpenAI product. This is a personal project and is not af
 
 # Credits
 
+- [virtualharby](https://twitter.com/virtualharby) - Memes for emotional support
 - [rawandahmad698](https://github.com/rawandahmad698) - Reverse engineering Auth0
 - [FlorianREGAZ](https://github.com/FlorianREGAZ) - TLS client
 - [PyRo1121](https://github.com/PyRo1121) - Linting

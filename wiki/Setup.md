@@ -2,6 +2,8 @@
 
 `pip3 install --upgrade revChatGPT`
 
+(MacOS might need `brew install --cask chromedriver`. View [#380](https://github.com/acheong08/ChatGPT/issues/380))
+
 ## Dependencies
 
 Make sure Chrome or Chromium is installed
@@ -47,6 +49,10 @@ You must define the session token or (email and password) for Microsoft Login in
     "isMicrosoftLogin": True
   }
   ```
+```
+True → Python dict
+true → JSON
+```
 
   **Note: `email` and `password` parameters will override `session_token`**
 
@@ -54,9 +60,7 @@ You must define the session token or (email and password) for Microsoft Login in
 
 You can use `Xvfb` to emulate a a display buffer.
 
-```
-xvfb-run -a python3 client.py
-```
+https://github.com/ultrafunkamsterdam/undetected-chromedriver/issues/743#issuecomment-1366847803
 
 # Config options (Optional)
 
@@ -71,6 +75,14 @@ xvfb-run -a python3 client.py
   "driver_exec_path": "./path/to/driver",
   "browser_exec_path": "./path/to/browser",
   "conversation": "<DEFAULT CONVERSATION UUID>",
+  "parent_id": "<DEFAULT PARENT ID>"
   "verbose": True | False
 }
+```
+It is impossible to easily get the parent_id and conversation_id from the website. You can only get it programmatically. Don't mess with it unless you know what you are doing
+
+`"driver_exec_path": "/usr/local/bin/chromedriver"` might be necessary for MacOS
+```
+True → Python dict
+true → JSON
 ```
